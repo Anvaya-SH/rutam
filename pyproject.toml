@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rutam"
+version = "0.1.0"
+description = "RUTAM's persistent graph-memory foundation, developed by Anvaya.sh"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Anvaya.sh"}]
+dependencies = ["torch>=2.5", "safetensors>=0.4.5", "numpy>=1.26", "PyYAML>=6.0.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rutam"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+# Keep local installs CPU-only, including `uv sync --extra dev`.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = {index = "pytorch-cpu"}
