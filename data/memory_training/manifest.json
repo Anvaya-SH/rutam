@@ -1,0 +1,24 @@
+{
+  "created_at": "2026-11-14T04:29:11.268557+00:00",
+  "dataset_version": "1.0.0",
+  "file_hashes": {
+    "schema.json": "8a9823729be4c3150a0e3811fd9b07703f443f254dc28762f2e978cce39f4ee2",
+    "statistics.json": "29cba668600a942a2ed7871cee4aaab0de250965b51111c5b80916c4b1412e84",
+    "test.jsonl": "1ba679184f1569f0b2605d9828aa1f61e7d1d87e06e606486c49e053e293ffb7",
+    "train.jsonl": "918523df1e8ce1eeecb2f83f289a1cfddd4587164bb35dd0f633975bf0f03a85",
+    "validation.jsonl": "7cdaaf20afb292cd6be0704183d23621a6747901f02d6d049781bcc69ab3d24d"
+  },
+  "known_limitations": [
+    "Synthetic scenarios only; does not represent verified real-world facts.",
+    "Small bounded graphs designed for deterministic CPU testing."
+  ],
+  "random_seed": 42,
+  "schema_version": "1.0.0",
+  "split_counts": {
+    "test": 85,
+    "train": 815,
+    "validation": 100
+  },
+  "total_count": 1000,
+  "validation_status": "VALID"
+}

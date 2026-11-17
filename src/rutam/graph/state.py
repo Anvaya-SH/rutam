@@ -58,6 +58,7 @@ class GraphState:
     next_node_id: int
     retired_node_ids: tuple[int, ...]
     metadata: dict[str, Any]
+    retired_edge_ids: tuple[str, ...] = ()
 
     def tensors(self) -> dict[str, torch.Tensor]:
         return {
@@ -128,4 +129,114 @@ class GraphState:
             raise ValidationError("edge_metadata length must equal E")
         for record in self.node_metadata + self.edge_metadata:
             json_copy(record)
+        edge_ids = [record.get("edge_id") for record in self.edge_metadata]
+        if any(edge_id is not None and (not isinstance(edge_id, str) or not edge_id) for edge_id in edge_ids):
+            raise ValidationError("edge_id values must be nonempty strings")
+        present_edge_ids = [edge_id for edge_id in edge_ids if edge_id is not None]
+        if len(present_edge_ids) != len(set(present_edge_ids)):
+            raise ValidationError("Live edge IDs must be unique")
+        if not isinstance(self.retired_edge_ids, tuple):
+            raise ValidationError("retired_edge_ids must be a tuple")
+        for edge_id in self.retired_edge_ids:
+            nonempty_string(edge_id, "retired edge ID")
+        retired_edges = set(self.retired_edge_ids)
+        if len(retired_edges) != len(self.retired_edge_ids) or retired_edges.intersection(present_edge_ids):
+            raise ValidationError("Retired edge IDs must be unique and disjoint from live IDs")
         json_copy(self.metadata)
+
+    def extract_subgraph(
+        self,
+        node_indices: torch.Tensor | list[int] | tuple[int, ...],
+        *,
+        edge_mask: torch.Tensor | None = None,
+    ) -> tuple[GraphState, torch.Tensor]:
+        """Extract a self-contained induced subgraph for bounded sparse execution.
+
+        Parameters
+        ----------
+        node_indices : torch.Tensor | Sequence[int]
+            Indices of nodes to retain from this state's node_ids tensor.
+        edge_mask : torch.Tensor | None
+            Optional boolean mask over edges (e.g. for validity / visibility filtering).
+
+        Returns
+        -------
+        sub_state : GraphState
+            A valid GraphState containing only the selected nodes and induced edges.
+        retained_indices : torch.Tensor
+            Sorted 1D int64 tensor of original node indices included in sub_state.
+        """
+        if isinstance(node_indices, torch.Tensor):
+            valid = (node_indices >= 0) & (node_indices < self.node_ids.shape[0])
+            retained = torch.unique(node_indices[valid])
+        else:
+            n = self.node_ids.shape[0]
+            retained = torch.tensor(
+                sorted(set(i for i in node_indices if 0 <= i < n)),
+                dtype=torch.int64,
+                device="cpu",
+            )
+        k = retained.shape[0]
+        if k == 0:
+            sub_state = GraphState(
+                node_ids=torch.empty(0, dtype=torch.int64),
+                node_embeddings=torch.empty(0, self.config.graph.embedding_dim, dtype=torch.float32),
+                edge_index=torch.empty(2, 0, dtype=torch.int64),
+                edge_types=torch.empty(0, dtype=torch.int64),
+                edge_weights=torch.empty(0, dtype=torch.float32),
+                node_metadata=[],
+                edge_metadata=[],
+                relationship_types=dict(self.relationship_types),
+                graph_version=self.graph_version,
+                config=self.config,
+                next_node_id=self.next_node_id,
+                retired_node_ids=self.retired_node_ids,
+                metadata=self.metadata,
+                retired_edge_ids=self.retired_edge_ids,
+            )
+            return sub_state, retained
+
+        sub_node_ids = self.node_ids[retained]
+        sub_node_embeddings = self.node_embeddings[retained]
+        sub_node_metadata = [self.node_metadata[i.item()] for i in retained]
+
+        inverse_map = torch.full((self.node_ids.shape[0],), -1, dtype=torch.int64, device="cpu")
+        inverse_map[retained] = torch.arange(k, dtype=torch.int64, device="cpu")
+
+        if self.edge_index.shape[1] > 0:
+            src_new = inverse_map[self.edge_index[0]]
+            dst_new = inverse_map[self.edge_index[1]]
+            induced_edge_mask = (src_new >= 0) & (dst_new >= 0)
+            if edge_mask is not None:
+                induced_edge_mask = induced_edge_mask & edge_mask
+            sub_edge_index = torch.stack([src_new[induced_edge_mask], dst_new[induced_edge_mask]], dim=0)
+            sub_edge_types = self.edge_types[induced_edge_mask]
+            sub_edge_weights = self.edge_weights[induced_edge_mask]
+            mask_list = induced_edge_mask.tolist()
+            sub_edge_metadata = [
+                self.edge_metadata[i] for i, is_inc in enumerate(mask_list) if is_inc
+            ]
+        else:
+            sub_edge_index = torch.empty(2, 0, dtype=torch.int64)
+            sub_edge_types = torch.empty(0, dtype=torch.int64)
+            sub_edge_weights = torch.empty(0, dtype=torch.float32)
+            sub_edge_metadata = []
+
+        sub_state = GraphState(
+            node_ids=sub_node_ids,
+            node_embeddings=sub_node_embeddings,
+            edge_index=sub_edge_index,
+            edge_types=sub_edge_types,
+            edge_weights=sub_edge_weights,
+            node_metadata=sub_node_metadata,
+            edge_metadata=sub_edge_metadata,
+            relationship_types=dict(self.relationship_types),
+            graph_version=self.graph_version,
+            config=self.config,
+            next_node_id=self.next_node_id,
+            retired_node_ids=self.retired_node_ids,
+            metadata=self.metadata,
+            retired_edge_ids=self.retired_edge_ids,
+        )
+        return sub_state, retained
+

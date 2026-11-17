@@ -17,8 +17,16 @@ class GraphReferenceError(ValidationError):
     """An operation refers to a missing node or relationship."""
 
 
+class StaleGraphError(ValidationError):
+    """A proposal or inference request refers to an outdated graph version."""
+
+
 class StorageError(RUTAMError):
     """A snapshot could not be read or written."""
+
+
+class SnapshotConflictError(StorageError):
+    """The active graph snapshot changed since this writer last observed it."""
 
 
 class SnapshotNotFoundError(StorageError, FileNotFoundError):
@@ -27,3 +35,7 @@ class SnapshotNotFoundError(StorageError, FileNotFoundError):
 
 class CorruptSnapshotError(StorageError):
     """Snapshot files, hashes, metadata, or tensor invariants disagree."""
+
+
+class NumericalInstabilityError(RUTAMError, RuntimeError):
+    """Training loss or gradient encountered NaN or Inf."""

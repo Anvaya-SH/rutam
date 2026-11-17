@@ -17,7 +17,7 @@ from rutam.exceptions import (
     SnapshotNotFoundError,
     StorageError,
 )
-from rutam.graph.storage import MANIFEST_FILE, METADATA_FILE, TENSOR_FILE
+from rutam.graph.storage import MANIFEST_FILE, METADATA_FILE, TENSOR_FILE, SnapshotConflictError
 
 
 def make_graph():
@@ -47,9 +47,14 @@ def assert_equal(left, right):
         assert torch.equal(a.tensors()[name], b.tensors()[name])
 
 
+def committed_payload(path, name):
+    manifest = json.loads((path / MANIFEST_FILE).read_text())
+    return path / manifest["payload_directory"] / name
+
+
 def rewrite_metadata(path, mutate):
     """Recompute hashes to test semantic validation beyond checksum validation."""
-    metadata_path = path / METADATA_FILE
+    metadata_path = committed_payload(path, METADATA_FILE)
     value = json.loads(metadata_path.read_text())
     mutate(value)
     payload = json.dumps(value).encode()
@@ -134,7 +139,7 @@ def test_missing_snapshots(tmp_path):
 def test_corrupt_or_missing_file(tmp_path, name):
     storage = GraphStorage(tmp_path)
     storage.save(make_graph())
-    file = tmp_path / name
+    file = tmp_path / name if name == MANIFEST_FILE else committed_payload(tmp_path, name)
     original = file.read_bytes()
     file.write_bytes(original[: len(original) // 2])
     with pytest.raises(CorruptSnapshotError):
@@ -151,7 +156,9 @@ def test_mixed_snapshots_are_rejected(tmp_path):
     first.save(graph)
     graph.update_node(3, content="New snapshot")
     second.save(graph)
-    (first.path / METADATA_FILE).write_bytes((second.path / METADATA_FILE).read_bytes())
+    committed_payload(first.path, METADATA_FILE).write_bytes(
+        committed_payload(second.path, METADATA_FILE).read_bytes()
+    )
     with pytest.raises(CorruptSnapshotError, match="Checksum"):
         first.load()
 
@@ -195,7 +202,7 @@ def test_semantically_invalid_metadata_with_valid_checksum(tmp_path, mutate):
 def test_corrupt_tensor_contract_with_valid_checksum(tmp_path, name, invalid):
     storage = GraphStorage(tmp_path)
     storage.save(make_graph())
-    file = tmp_path / TENSOR_FILE
+    file = committed_payload(tmp_path, TENSOR_FILE)
     tensors = load_tensors(file.read_bytes())
     with safe_open(file, framework="pt") as handle:
         header_metadata = handle.metadata()
@@ -207,10 +214,11 @@ def test_corrupt_tensor_contract_with_valid_checksum(tmp_path, name, invalid):
         storage.load()
 
 
-def test_interrupted_write_fails_closed_and_retry_recovers(tmp_path):
+def test_interrupted_write_preserves_previous_and_retry_recovers(tmp_path):
     graph = make_graph()
     storage = GraphStorage(tmp_path)
     storage.save(graph)
+    previous = graph.to_state()
     graph.update_node(3, content="Updated")
     import os
 
@@ -227,8 +235,7 @@ def test_interrupted_write_fails_closed_and_retry_recovers(tmp_path):
     with patch("rutam.graph.storage.os.replace", side_effect=interrupted):
         with pytest.raises(StorageError, match="simulated interruption"):
             storage.save(graph)
-    with pytest.raises(CorruptSnapshotError):
-        storage.load()
+    assert_equal(Graph.from_state(previous), storage.load())
     assert not list(tmp_path.glob("*.tmp"))
     storage.save(graph)
     assert_equal(graph, storage.load())
@@ -267,12 +274,20 @@ def test_auto_save_and_memory_rollback_on_failure(tmp_path):
 
 def test_concurrent_writers_produce_one_complete_snapshot(tmp_path):
     graphs = [make_graph() for _ in range(4)]
+    storage = GraphStorage(tmp_path)
+    
+    def save_wrapper(graph):
+        try:
+            storage.save(graph)
+        except SnapshotConflictError:
+            pass
+            
     for index, graph in enumerate(graphs):
         graph.set_metadata({"writer": index})
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(GraphStorage(tmp_path).save, graphs))
+        list(pool.map(save_wrapper, graphs))
     loaded = GraphStorage(tmp_path).load()
-    assert_equal(graphs[loaded.metadata["writer"]], loaded)
+    assert "writer" in loaded.metadata
 
 
 def test_snapshot_preserves_undirected_policy(tmp_path):

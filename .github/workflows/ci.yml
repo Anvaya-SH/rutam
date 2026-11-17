@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build-install:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install uv and select Python
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Install locked project and development dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Run test suite
+        run: uv run --locked --extra dev python -m pytest -q
+
+      - name: Build wheel and source distribution
+        run: uv build --out-dir "$RUNNER_TEMP/rutam-dist"
+
+      - name: Install built wheel into the test environment
+        run: |
+          uv pip uninstall --python .venv/bin/python rutam
+          uv pip install --python .venv/bin/python --no-deps "$RUNNER_TEMP"/rutam-dist/*.whl
+
+      - name: Smoke test installed wheel and console scripts
+        working-directory: ${{ runner.temp }}
+        env:
+          RUTAM_VENV: ${{ github.workspace }}/.venv
+        run: |
+          "$RUTAM_VENV/bin/python" - <<'PY'
+          import pathlib
+          import rutam
+
+          module_path = pathlib.Path(rutam.__file__).resolve()
+          assert "site-packages" in module_path.parts, module_path
+          print(f"Imported installed wheel: {module_path}")
+          print(f"RUTAM version: {rutam.__version__}")
+          PY
+          "$RUTAM_VENV/bin/rutam-prepare" --help
+          "$RUTAM_VENV/bin/rutam-verify" --help
+          "$RUTAM_VENV/bin/rutam-attach-lfm3" --help

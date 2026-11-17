@@ -24,6 +24,7 @@ from safetensors.torch import save as serialize_tensors
 from rutam.config import RUTAMConfig
 from rutam.exceptions import (
     CorruptSnapshotError,
+    SnapshotConflictError,
     SnapshotNotFoundError,
     StorageError,
     ValidationError,
@@ -36,6 +37,13 @@ TENSOR_FILE = "graph.safetensors"
 METADATA_FILE = "graph.json"
 MANIFEST_FILE = "graph.manifest.json"
 TENSOR_NAMES = {"node_ids", "node_embeddings", "edge_index", "edge_types", "edge_weights"}
+
+
+_UNSET = object()
+
+
+class SnapshotPublicationError(StorageError):
+    """Manifest was published but its directory fsync failed; durability is uncertain."""
 
 
 def _json_bytes(value: dict[str, Any]) -> bytes:
@@ -78,9 +86,9 @@ def _sync_directory(path: Path) -> None:
 class GraphStorage:
     """Local POSIX filesystem snapshots. Hashes detect corruption, not hostile edits.
 
-    Save publishes three fixed filenames under `path`. The manifest binds both
-    payloads to one snapshot ID, graph version and schema version. No history or
-    automatic recovery of an interrupted checkpoint is provided in schema v1.
+    Immutable generations are committed by one atomic manifest replacement.
+    Fixed-name payloads are compatibility aliases. Legacy schema v1 is readable.
+    POSIX local filesystems only; hashes detect damage, not hostile modification.
     """
 
     def __init__(self, path: str | Path = "data/graph") -> None:
@@ -97,8 +105,30 @@ class GraphStorage:
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
-    def save(self, graph: Graph) -> None:
-        """Validate first, fsync temporary payloads, replace payloads, commit manifest."""
+    def save(
+        self, graph: Graph, *, expected_generation: str | None | object = _UNSET,
+        unconditional: bool = False, bind: bool = True,
+    ) -> None:
+        """Publish with a manifest CAS; a new destination must have no manifest.
+
+        Loaded/saved graphs retain their generation for this path. Explicit
+        ``unconditional=True`` opts into unsafe last-writer-wins compatibility.
+        ``bind=False`` is for independent exports and does not rebind the graph.
+        """
+        if unconditional and expected_generation is not _UNSET:
+            raise ValueError("unconditional and expected_generation are mutually exclusive")
+        with graph._mutation_lock:
+            path = str(self.path.resolve())
+            if expected_generation is _UNSET:
+                expected_generation = (
+                    graph._storage_generation if graph._storage_path == path else None
+                )
+            self._save_locked(graph, expected_generation, unconditional, bind, path)
+
+    def _save_locked(
+        self, graph: Graph, expected_generation: str | None | object,
+        unconditional: bool, bind: bool, path: str,
+    ) -> None:
         state = graph.to_state()
         # Validate textual records as well as tensors, including caller-created states.
         Graph.from_state(state)
@@ -111,12 +141,14 @@ class GraphStorage:
             "metadata": state.metadata,
             "next_node_id": state.next_node_id,
             "retired_node_ids": list(state.retired_node_ids),
+            "retired_edge_ids": list(state.retired_edge_ids),
             "relationship_types": state.relationship_types,
             "id_to_row": {str(value): row for row, value in enumerate(state.node_ids.tolist())},
             "nodes": state.node_metadata,
             "edges": state.edge_metadata,
         }
         temporary: list[Path] = []
+        published = False
         try:
             tensor_bytes = serialize_tensors(
                 state.tensors(),
@@ -132,6 +164,7 @@ class GraphStorage:
                     "schema_version": SCHEMA_VERSION,
                     "snapshot_id": snapshot_id,
                     "graph_version": state.graph_version,
+                    "payload_directory": f"snapshot-{snapshot_id}",
                     "files": {
                         TENSOR_FILE: {"sha256": _digest(tensor_bytes), "size": len(tensor_bytes)},
                         METADATA_FILE: {
@@ -143,24 +176,108 @@ class GraphStorage:
             )
             self.path.mkdir(parents=True, exist_ok=True)
             with self._lock(exclusive=True):
-                for payload in (tensor_bytes, metadata_bytes, manifest_bytes):
-                    with tempfile.NamedTemporaryFile(
-                        dir=self.path, prefix=".graph-", suffix=".tmp", delete=False
-                    ) as handle:
-                        temporary.append(Path(handle.name))
+                active_manifest = self.path / MANIFEST_FILE
+                old = _read_json(active_manifest.read_bytes()) if active_manifest.exists() else None
+                current = old["snapshot_id"] if old is not None else None
+                if current is not None and (
+                    not isinstance(current, str) or uuid.UUID(hex=current).hex != current
+                ):
+                    raise ValueError("Invalid active snapshot ID")
+                if not unconditional and current != expected_generation:
+                    raise SnapshotConflictError(
+                        f"STALE_SNAPSHOT_GENERATION: expected {expected_generation!r}, "
+                        f"found {current!r} at {self.path}"
+                    )
+                if old is not None:
+                    old_dir = self.path / f"snapshot-{old['snapshot_id']}"
+                    if not old_dir.exists():
+                        old_dir.mkdir()
+                        for name in (TENSOR_FILE, METADATA_FILE, MANIFEST_FILE):
+                            with (old_dir / name).open("xb") as out:
+                                out.write((self.path / name).read_bytes())
+                                out.flush()
+                                os.fsync(out.fileno())
+                        _sync_directory(old_dir)
+                snapshot_dir = self.path / f"snapshot-{snapshot_id}"
+                snapshot_dir.mkdir()
+                staged = []
+                for name, payload in ((TENSOR_FILE, tensor_bytes), (METADATA_FILE, metadata_bytes)):
+                    target = snapshot_dir / name
+                    with target.open("xb") as handle:
                         handle.write(payload)
                         handle.flush()
                         os.fsync(handle.fileno())
-                os.replace(temporary[0], self.path / TENSOR_FILE)
-                os.replace(temporary[1], self.path / METADATA_FILE)
+                    staged.append(target)
+                with (snapshot_dir / MANIFEST_FILE).open("xb") as handle:
+                    handle.write(manifest_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                _sync_directory(snapshot_dir)
                 _sync_directory(self.path)
-                os.replace(temporary[2], self.path / MANIFEST_FILE)
+                # Keep fixed-name compatibility aliases for existing integrations.
+                # Readers use the immutable generation named by the manifest.
+                for name, source in zip((TENSOR_FILE, METADATA_FILE), staged, strict=True):
+                    alias = self.path / f".{name}.{snapshot_id}.tmp"
+                    temporary.append(alias)
+                    with alias.open("xb") as handle:
+                        handle.write(source.read_bytes())
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                os.replace(temporary[-2], self.path / TENSOR_FILE)
+                os.replace(temporary[-1], self.path / METADATA_FILE)
+                with tempfile.NamedTemporaryFile(
+                    dir=self.path, prefix=".graph-", suffix=".tmp", delete=False
+                ) as handle:
+                    temporary.append(Path(handle.name))
+                    handle.write(manifest_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary[-1], self.path / MANIFEST_FILE)
+                published = True
+                if bind:
+                    graph._storage_generation = snapshot_id
+                    graph._storage_path = path
+                    graph._storage = self
                 _sync_directory(self.path)
         except (OSError, SafetensorError, ValueError) as exc:
+            if published:
+                raise SnapshotPublicationError(
+                    f"Graph snapshot published at {self.path}, but durability is uncertain: {exc}"
+                ) from exc
+            # Restore compatibility exports to the committed generation on ordinary
+            # I/O failures. Crash consistency is defined by manifest-based load().
+            if self.path.exists() and (self.path / MANIFEST_FILE).exists():
+                try:
+                    with self._lock(exclusive=True):
+                        committed = _read_json((self.path / MANIFEST_FILE).read_bytes())
+                        source = self.path / f"snapshot-{committed['snapshot_id']}"
+                        if source.is_dir():
+                            for name in (TENSOR_FILE, METADATA_FILE):
+                                alias = self.path / name
+                                with tempfile.NamedTemporaryFile(
+                                    dir=self.path,
+                                    prefix=".graph-recover-",
+                                    suffix=".tmp",
+                                    delete=False,
+                                ) as handle:
+                                    temp = Path(handle.name)
+                                    temporary.append(temp)
+                                    handle.write((source / name).read_bytes())
+                                    handle.flush()
+                                    os.fsync(handle.fileno())
+                                os.rename(temp, alias)
+                            _sync_directory(self.path)
+                except OSError:
+                    # Keep the original error. load() still follows immutable files.
+                    pass
             raise StorageError(f"Cannot save graph snapshot at {self.path}: {exc}") from exc
         finally:
             for path in temporary:
-                path.unlink(missing_ok=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    # Cleanup must not turn a published snapshot into an apparent failure.
+                    pass
 
     def load(self) -> Graph:
         """Load exactly the persisted configuration, including auto_save and provenance policy.
@@ -192,8 +309,15 @@ class GraphStorage:
                         "Manifest must reference exactly the two snapshot files"
                     )
                 payloads = {}
+                generation = self.path / f"snapshot-{snapshot_id}"
+                directory = manifest.get("payload_directory")
+                if directory is not None and directory != generation.name:
+                    raise CorruptSnapshotError("Invalid snapshot payload directory")
+                if directory is not None and not generation.is_dir():
+                    raise CorruptSnapshotError("Committed snapshot generation is missing")
+                source_dir = generation if generation.is_dir() else self.path
                 for name in (TENSOR_FILE, METADATA_FILE):
-                    data = (self.path / name).read_bytes()
+                    data = (source_dir / name).read_bytes()
                     entry = manifest["files"][name]
                     if (
                         type(entry["size"]) is not int
@@ -237,6 +361,7 @@ class GraphStorage:
                     config=RUTAMConfig.from_dict(metadata["config"]),
                     next_node_id=metadata["next_node_id"],
                     retired_node_ids=tuple(metadata["retired_node_ids"]),
+                    retired_edge_ids=tuple(metadata.get("retired_edge_ids", [])),
                     metadata=metadata["metadata"],
                 )
                 state.validate()
@@ -245,7 +370,10 @@ class GraphStorage:
                     type(row) is not int for row in metadata["id_to_row"].values()
                 ):
                     raise CorruptSnapshotError("Node ID-to-row mapping is inconsistent")
-                return Graph.from_state(state, storage=self)
+                graph = Graph.from_state(state, storage=self)
+                graph._storage_generation = snapshot_id
+                graph._storage_path = str(self.path.resolve())
+                return graph
         except (SnapshotNotFoundError, CorruptSnapshotError):
             raise
         except (
@@ -266,3 +394,23 @@ class GraphStorage:
             ) from exc
         except OSError as exc:
             raise StorageError(f"Cannot read graph snapshot at {self.path}: {exc}") from exc
+
+    def rollback(self, snapshot_id: str) -> Graph:
+        """Validate an older completed generation and publish it as a new snapshot."""
+        if not isinstance(snapshot_id, str) or uuid.UUID(hex=snapshot_id).hex != snapshot_id:
+            raise ValidationError("Invalid rollback snapshot ID")
+        # Capture the active generation before validating the historical payload;
+        # publishing later must fail if any other writer has advanced it.
+        active = self.load()
+        expected = active._storage_generation
+        generation = self.path / f"snapshot-{snapshot_id}"
+        manifest = _read_json((generation / MANIFEST_FILE).read_bytes())
+        manifest.pop("payload_directory", None)
+        with tempfile.TemporaryDirectory(dir=self.path) as tmp:
+            check = Path(tmp)
+            for name in (TENSOR_FILE, METADATA_FILE):
+                os.link(generation / name, check / name)
+            (check / MANIFEST_FILE).write_bytes(_json_bytes(manifest))
+            graph = GraphStorage(check).load()
+        self.save(graph, expected_generation=expected)
+        return graph

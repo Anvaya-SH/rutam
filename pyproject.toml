@@ -7,12 +7,44 @@ name = "rutam"
 version = "0.1.0"
 description = "RUTAM's persistent graph-memory foundation, developed by Anvaya.sh"
 readme = "README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
-authors = [{name = "Anvaya.sh"}]
-dependencies = ["torch>=2.5", "safetensors>=0.4.5", "numpy>=1.26", "PyYAML>=6.0.2"]
+authors = [{ name = "Anvaya.sh" }]
+keywords = [
+    "graph-neural-network",
+    "memory-augmented-llm",
+    "persistent-memory",
+    "lfm3",
+    "pytorch",
+    "cpu-first",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5",
+    "safetensors>=0.4.5",
+    "numpy>=1.26",
+    "PyYAML>=6.0.2",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3", "ruff>=0.9"]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+rutam-prepare = "rutam.installer:main_prepare"
+rutam-verify = "rutam.installer:main_verify"
+rutam-attach-lfm3 = "rutam.installer:main_attach_lfm3"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rutam"]

@@ -1,0 +1,270 @@
+# RUTAM Default Production Configuration
+# Developed by Anvaya.sh
+# Default CPU-first architecture configuration for persistent graph memory and LFM3 backbone integration.
+
+project_name: RUTAM
+backbone: LiquidAI/LFM3-1.7B-Base
+graph:
+  path: data/graph
+  embedding_dim: 128
+  directed: true
+  max_nodes: 100000
+  max_edges: 500000
+  initial_nodes: 0
+  auto_save: false
+memory:
+  validation_enabled: true
+  require_provenance: true
+runtime:
+  device: cpu
+  dtype: float32
+encoder:
+  input_dim: 128
+  hidden_dim: 128
+  num_layers: 2
+  num_relation_types: 32
+  dropout: 0.1
+  activation: gelu
+  aggregation: mean
+  residual: true
+  layer_norm: true
+  encoder_mode: message_passing
+graph_attention:
+  enabled: true
+  hidden_dim: 128
+  num_heads: 4
+  num_layers: 2
+  dropout: 0.1
+  relation_bias: true
+  query_conditioning: true
+  residual: true
+  normalization: layer_norm
+  sparse_attention: true
+  max_subgraph_nodes: 256
+  max_subgraph_edges: 2048
+  return_attention: false
+  num_relation_types: 32
+  query_dim: 128
+selector:
+  query_dim: 128
+  hidden_dim: 128
+  score_dim: 128
+  scoring_method: scaled_dot
+  top_k: 16
+  selection_mode: hard
+  temperature: 1.0
+  normalize_vectors: false
+  chunk_size: 4096
+  return_attention: false
+  max_dense_elements: 1000000
+query_head:
+  backbone_hidden_dim: 256
+  graph_hidden_dim: 128
+  query_dim: 128
+  intermediate_dim: 256
+  pooling: attention
+  dropout: 0.1
+  normalize_queries: true
+  graph_conditioning: true
+  conditioning_mode: gated_add
+  query_gate_enabled: true
+  gate_threshold: 0.5
+  return_attention: false
+  empty_sequence_policy: error
+  gate_use_availability: true
+  residual: false
+  residual_projection: false
+  norm_regularization_weight: 0.0
+traversal:
+  max_hops: 3
+  max_neighbors_per_node: 16
+  max_visited_nodes: 128
+  max_candidate_paths: 64
+  max_selected_paths: 8
+  direction: outgoing
+  deterministic: true
+  path_encoder: gru
+  path_hidden_dim: 128
+  path_scoring: additive
+  temperature: 1.0
+  include_seed_nodes: true
+  query_dim: 128
+  hidden_dim: 128
+  num_relation_types: 32
+  score_hidden_dim: 128
+  scoring_chunk_size: 128
+  include_edge_weights: true
+  dropout: 0.0
+  max_path_elements: 1000000
+linker:
+  hidden_dim: 128
+  scoring_hidden_dim: 256
+  dropout: 0.1
+  directed: true
+  allow_self_links: false
+  max_candidate_pairs: 512
+  candidate_strategy: neighborhood
+  max_candidate_hops: 2
+  link_threshold: 0.75
+  relation_threshold: 0.7
+  max_proposals_per_call: 32
+  use_structural_features: true
+  query_conditioning: false
+  negative_samples_per_positive: 3
+  loss_weights:
+    link: 1.0
+    relation: 1.0
+    ranking: 0.2
+  query_dim: 128
+  structural_feature_dim: 16
+  max_neighbors_per_node: 32
+  max_candidate_expansions: 4096
+  similarity_chunk_size: 4096
+  max_similarity_anchors: 32
+  negative_sampling_seed: 0
+  negative_sampling_attempts: 10000
+  scoring_chunk_size: 128
+  max_link_elements: 1000000
+  link_temperature: 1.0
+  relation_temperature: 1.0
+  positive_weight: 1.0
+  ranking_margin: 1.0
+  relation_schema_version: 1
+  relation_labels:
+  - related_to
+  - depends_on
+  - part_of
+  - causes
+  - supports
+  - contradicts
+  - derived_from
+  - precedes
+  conflicting_relations: []
+  compatible_node_types: []
+memory_write:
+  enabled: true
+  hidden_dim: 128
+  projection_dim: 256
+  max_proposals: 4
+  write_threshold: 0.7
+  operation_count: 7
+  use_graph_context: true
+  target_selection: true
+  normalize_embeddings: true
+  dropout: 0.1
+  commit_automatically: false
+  backbone_hidden_dim: 256
+  pooling: last_valid
+  empty_sequence_policy: error
+memory_validation:
+  enabled: true
+  require_provenance: true
+  allow_unverified_hypotheses: false
+  detect_duplicates: true
+  detect_structural_conflicts: true
+  reject_stale_updates: true
+  require_authorization: true
+  max_proposals_per_batch: 64
+  max_proposal_bytes: 65536
+  semantic_verification_enabled: false
+  default_decision: defer
+  content_similarity_threshold: 0.98
+  min_confidence: 0.5
+memory_controller:
+  enabled: true
+  read_enabled: true
+  write_enabled: true
+  auto_commit: false
+  require_validation: true
+  max_reads_per_request: 4
+  max_pending_proposals: 128
+  transaction_mode: atomic
+  preserve_snapshots: 5
+  audit_enabled: true
+  cache_graph_states: true
+  allow_destructive_updates: false
+memory_learning:
+  enabled: true
+  curriculum_enabled: true
+  use_fixed_loss_weights: true
+  ignore_missing_targets: true
+  write_loss_weight: 1.0
+  operation_loss_weight: 1.0
+  retrieval_loss_weight: 1.0
+  path_loss_weight: 0.5
+  link_loss_weight: 0.5
+  embedding_loss_weight: 0.5
+  query_gate_loss_weight: 0.5
+  update_target_loss_weight: 0.5
+graph_fusion:
+  enabled: true
+  hidden_dim: 256
+  graph_dim: 128
+  num_attention_heads: 4
+  attention_dropout: 0.0
+  projection_dropout: 0.1
+  fusion_mode: cross_attention
+  gate_mode: token
+  residual_scale_init: 0.001
+  use_reasoning_context: true
+  preserve_empty_identity: true
+  return_attention: false
+lfm3_adapter:
+  backbone_id: LiquidAI/LFM3-1.7B-Base
+  enabled: true
+  fusion_locations: []
+  backbone_frozen: true
+  graph_modules_trainable: true
+  integration_mode: explicit
+  require_verified_layers: true
+  preserve_output_interface: true
+  enable_cache: false
+  allow_remote_code: false
+rutam_model:
+  backbone: LiquidAI/LFM3-1.7B-Base
+  graph_enabled: true
+  graph_encoder_enabled: true
+  graph_selector_enabled: true
+  graph_traversal_enabled: true
+  graph_fusion_enabled: true
+  memory_write_enabled: true
+  memory_auto_commit: false
+  backbone_frozen: true
+  recurrent_loops_enabled: false
+  use_cached_graph_states: true
+  return_memory_diagnostics: false
+  query_layer_idx: 1
+  fusion_layer_idx: 1
+  mode: graph_native
+  sparse_selection_enabled: true
+  max_sparse_nodes: 64
+  sparse_max_hops: 2
+recurrent:
+  enabled: false
+  hidden_dim: 256
+  num_heads: 4
+  intermediate_dim: 1024
+  max_loops: 8
+  min_loops: 1
+  default_loops: 3
+  dynamic_halting: false
+  halting_threshold: 0.5
+  halt_exploration_prob: 0.0
+  dropout: 0.1
+  layer_norm_eps: 1.0e-05
+  residual_scale_init: 0.001
+  use_graph_conditioning: true
+  graph_dim: 128
+  loop_embedding_dim: 256
+  gate_type: elementwise
+  activation: gelu
+  causal: true
+  controller_hidden_dim: 64
+checkpoint:
+  base_dir: checkpoints
+  run_id: run_default
+  save_optimizer: true
+  save_graph: true
+  keep_last_n: 5
+  verify_on_save: true
+  verify_on_load: true

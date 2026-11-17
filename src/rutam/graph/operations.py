@@ -7,13 +7,15 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime
+from functools import wraps
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
 from rutam.config import RUTAMConfig, nonempty_string, positive_int
 from rutam.exceptions import DuplicateIDError, GraphReferenceError, ValidationError
-from rutam.graph.schema import Edge, Node, identifier, utc_now
+from rutam.graph.schema import MAX_ID, Edge, Node, identifier, utc_now
 from rutam.graph.state import GraphState, json_copy
 
 if TYPE_CHECKING:
@@ -22,11 +24,21 @@ if TYPE_CHECKING:
 Direction = Literal["outgoing", "incoming", "both"]
 
 
+def synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._mutation_lock:
+            return method(self, *args, **kwargs)
+
+    return call
+
+
 class Graph:
     """In-memory graph with stable IDs and optional transactional auto-save.
 
-    This object is single-threaded. Node/edge records are immutable. All returned
-    metadata and tensor snapshots are detached from live graph data.
+    Public mutations and snapshots share a per-graph reentrant lock.
+    Node/edge records are immutable. Returned metadata and tensor snapshots
+    are detached from live graph data.
     """
 
     def __init__(
@@ -36,17 +48,23 @@ class Graph:
         metadata: dict[str, Any] | None = None,
         storage: GraphStorage | None = None,
     ) -> None:
+        self._mutation_lock = RLock()
         self.config = RUTAMConfig() if config is None else config
         if not isinstance(self.config, RUTAMConfig):
             raise ValidationError("config must be a RUTAMConfig")
         self._nodes: dict[int, Node] = {}
         self._edges: dict[tuple[int, int, str], Edge] = {}
+        self._edge_ids: dict[str, tuple[int, int, str]] = {}
         self._relationship_types: dict[str, int] = {}
         self._retired_ids: set[int] = set()
+        self._retired_edge_ids: set[str] = set()
         self._next_node_id = 0
         self._version = 0
         self._metadata = json_copy({} if metadata is None else metadata)
         self._storage = storage
+        # Snapshot identity is tied to a resolved storage path, not graph version.
+        self._storage_generation: str | None = None
+        self._storage_path: str | None = None
 
     @property
     def version(self) -> int:
@@ -64,6 +82,7 @@ class Graph:
     def edges(self) -> tuple[Edge, ...]:
         return tuple(self._edges[key] for key in sorted(self._edges))
 
+    @synchronized
     def set_metadata(self, metadata: dict[str, Any]) -> None:
         value = json_copy(metadata)
         with self._mutation():
@@ -82,18 +101,24 @@ class Graph:
             node = replace(node, embedding=tuple(values))
         return node
 
+    @synchronized
     def create_node(
         self, node_type: str, content: str, *, node_id: int | None = None, **fields: Any
     ) -> Node:
+        if node_id is None:
+            if self._next_node_id > MAX_ID:
+                raise ValidationError("No additional signed int64 node IDs are available")
+            node_id = self._next_node_id
         return self.add_node(
             Node(
-                id=self._next_node_id if node_id is None else node_id,
+                id=node_id,
                 node_type=node_type,
                 content=content,
                 **fields,
             )
         )
 
+    @synchronized
     def add_node(self, node: Node) -> Node:
         if not isinstance(node, Node):
             raise ValidationError("add_node requires a Node")
@@ -114,23 +139,49 @@ class Graph:
         except KeyError as exc:
             raise GraphReferenceError(f"Node {node_id} does not exist") from exc
 
+    @synchronized
     def update_node(self, node_id: int, **changes: Any) -> Node:
         node = self.get_node(node_id)
-        allowed = {"node_type", "content", "provenance", "confidence", "embedding"}
+        allowed = {
+            "node_type",
+            "content",
+            "provenance",
+            "confidence",
+            "embedding",
+            "source_ref",
+            "evidence_ref",
+            "verification_status",
+            "valid_from",
+            "valid_until",
+            "scope",
+            "permissions",
+        }
         if not changes.keys() <= allowed:
-            raise ValidationError(
-                "Only node content, type, provenance, confidence and embedding change"
+            raise ValidationError("Only declared node fields can be changed")
+        node = self._normalize_node(
+            replace(
+                node,
+                **changes,
+                updated_at=max(utc_now(), node.updated_at),
+                version=node.version + 1,
             )
-        node = self._normalize_node(replace(node, **changes, updated_at=utc_now()))
+        )
         with self._mutation():
             self._nodes[node_id] = node
         return node
 
+    @synchronized
     def delete_node(self, node_id: int) -> None:
         self.get_node(node_id)
         with self._mutation():
             del self._nodes[node_id]
             self._retired_ids.add(node_id)
+            removed = [
+                edge for edge in self._edges.values() if node_id in (edge.source_id, edge.target_id)
+            ]
+            for edge in removed:
+                self._edge_ids.pop(edge.edge_id, None)
+                self._retired_edge_ids.add(edge.edge_id)
             self._edges = {
                 key: edge
                 for key, edge in self._edges.items()
@@ -145,11 +196,13 @@ class Graph:
             source_id, target_id = target_id, source_id
         return source_id, target_id, relationship
 
+    @synchronized
     def add_relationship(
         self, source_id: int, target_id: int, relationship: str, **fields: Any
     ) -> Edge:
         return self.add_edge(Edge(source_id, target_id, relationship, **fields))
 
+    @synchronized
     def add_edge(self, edge: Edge) -> Edge:
         if not isinstance(edge, Edge):
             raise ValidationError("add_edge requires an Edge")
@@ -165,6 +218,8 @@ class Graph:
         )
         if key in self._edges:
             raise ValidationError(f"Relationship {key} already exists")
+        if edge.edge_id in self._edge_ids or edge.edge_id in self._retired_edge_ids:
+            raise ValidationError(f"Edge ID {edge.edge_id} is already live or retired")
         if len(self._edges) >= self.config.graph.max_edges:
             raise ValidationError("Graph max_edges capacity reached")
         with self._mutation():
@@ -173,6 +228,7 @@ class Graph:
                     max(self._relationship_types.values(), default=-1) + 1
                 )
             self._edges[key] = edge
+            self._edge_ids[edge.edge_id] = key
         return edge
 
     def get_relationship(self, source_id: int, target_id: int, relationship: str) -> Edge:
@@ -182,23 +238,41 @@ class Graph:
         except KeyError as exc:
             raise GraphReferenceError(f"Relationship {key} does not exist") from exc
 
+    @synchronized
     def update_relationship(
         self, source_id: int, target_id: int, relationship: str, **changes: Any
     ) -> Edge:
         edge = self.get_relationship(source_id, target_id, relationship)
-        if not changes.keys() <= {"weight", "provenance"}:
-            raise ValidationError("Only relationship weight and provenance can change")
-        edge = replace(edge, **changes, timestamp=utc_now())
+        allowed = {
+            "weight",
+            "provenance",
+            "confidence",
+            "status",
+            "valid_from",
+            "valid_until",
+            "scope",
+        }
+        if not changes.keys() <= allowed:
+            raise ValidationError("Only declared relationship fields can be changed")
+        edge = replace(
+            edge,
+            **changes,
+            timestamp=max(utc_now(), edge.timestamp),
+            version=edge.version + 1,
+        )
         self._check_provenance(edge.provenance)
         edge = replace(edge, weight=torch.tensor(edge.weight, dtype=torch.float32).item())
         with self._mutation():
             self._edges[edge.key] = edge
         return edge
 
+    @synchronized
     def remove_relationship(self, source_id: int, target_id: int, relationship: str) -> None:
         edge = self.get_relationship(source_id, target_id, relationship)
         with self._mutation():
             del self._edges[edge.key]
+            self._edge_ids.pop(edge.edge_id, None)
+            self._retired_edge_ids.add(edge.edge_id)
 
     def _adjacency(self, direction: Direction, relationship: str | None) -> dict[int, set[int]]:
         if direction not in ("outgoing", "incoming", "both"):
@@ -247,6 +321,7 @@ class Graph:
                     queue.append((neighbor, depth + 1))
         return tuple(result)
 
+    @synchronized
     def to_state(self) -> GraphState:
         nodes, edges = self.nodes, self.edges
         rows = {node.id: row for row, node in enumerate(nodes)}
@@ -257,17 +332,24 @@ class Graph:
                 embeddings[row] = torch.tensor(node.embedding, dtype=torch.float32)
             record = asdict(node)
             del record["embedding"]
+            record["permissions"] = list(node.permissions)
             record.update(
                 created_at=node.created_at.isoformat(),
                 updated_at=node.updated_at.isoformat(),
                 has_embedding=node.embedding is not None,
             )
+            for field in ("valid_from", "valid_until"):
+                if node_value := record[field]:
+                    record[field] = node_value.isoformat()
             node_metadata.append(record)
         edge_metadata = []
         for edge in edges:
             record = asdict(edge)
             del record["weight"]
             record["timestamp"] = edge.timestamp.isoformat()
+            for field in ("valid_from", "valid_until"):
+                if edge_value := record[field]:
+                    record[field] = edge_value.isoformat()
             edge_metadata.append(record)
         state = GraphState(
             node_ids=torch.tensor([n.id for n in nodes], dtype=torch.int64),
@@ -288,6 +370,7 @@ class Graph:
             next_node_id=self._next_node_id,
             retired_node_ids=tuple(sorted(self._retired_ids)),
             metadata=self.metadata,
+            retired_edge_ids=tuple(sorted(self._retired_edge_ids)),
         )
         state.validate()
         return state
@@ -306,6 +389,11 @@ class Graph:
                     raise ValidationError("Missing embeddings must have all-zero tensor rows")
                 for field in ("created_at", "updated_at"):
                     values[field] = datetime.fromisoformat(values[field])
+                for field in ("valid_from", "valid_until"):
+                    if values.get(field) is not None:
+                        values[field] = datetime.fromisoformat(values[field])
+                if isinstance(values.get("permissions"), list):
+                    values["permissions"] = tuple(values["permissions"])
                 values["embedding"] = (
                     tuple(state.node_embeddings[row].tolist()) if has_embedding else None
                 )
@@ -317,7 +405,18 @@ class Graph:
             for column, record in enumerate(state.edge_metadata):
                 values = dict(record)
                 values["timestamp"] = datetime.fromisoformat(values["timestamp"])
+                for field in ("valid_from", "valid_until"):
+                    if values.get(field) is not None:
+                        values[field] = datetime.fromisoformat(values[field])
                 values["weight"] = state.edge_weights[column].item()
+                if "edge_id" not in values:
+                    import uuid
+
+                    edge_key = (values["source_id"], values["target_id"], values["relationship"])
+                    canonical_key = graph._key(*edge_key)
+                    values["edge_id"] = uuid.uuid5(
+                        uuid.NAMESPACE_URL, f"rutam:legacy-edge:{canonical_key!r}"
+                    ).hex
                 edge = Edge(**values)
                 graph._check_provenance(edge.provenance)
                 source, target = state.edge_index[:, column].tolist()
@@ -329,13 +428,17 @@ class Graph:
                     or edge.key in graph._edges
                 ):
                     raise ValidationError("Duplicate edge or inconsistent relationship metadata")
+                if edge.edge_id in graph._edge_ids or edge.edge_id in state.retired_edge_ids:
+                    raise ValidationError("Duplicate or retired edge ID")
                 graph._edges[edge.key] = edge
+                graph._edge_ids[edge.edge_id] = edge.key
             if list(graph._edges) != sorted(graph._edges):
                 raise ValidationError("Relationships must be in canonical sorted order")
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise ValidationError(f"Invalid graph record metadata: {exc}") from exc
         graph._relationship_types = dict(state.relationship_types)
         graph._retired_ids = set(state.retired_node_ids)
+        graph._retired_edge_ids = set(state.retired_edge_ids)
         graph._next_node_id = state.next_node_id
         graph._version = state.graph_version
         return graph
@@ -352,8 +455,10 @@ class Graph:
             backup = (
                 self._nodes.copy(),
                 self._edges.copy(),
+                self._edge_ids.copy(),
                 self._relationship_types.copy(),
                 self._retired_ids.copy(),
+                self._retired_edge_ids.copy(),
                 self._next_node_id,
                 self._version,
                 self._metadata,
@@ -363,13 +468,19 @@ class Graph:
             self._version += 1
             if self.config.graph.auto_save:
                 self.save()
-        except Exception:
-            if backup is not None:
+        except Exception as exc:
+            from rutam.graph.storage import SnapshotPublicationError
+
+            # The new manifest is already visible. Retain the matching live state,
+            # while propagating the explicit uncertainty about durable fsync.
+            if backup is not None and not isinstance(exc, SnapshotPublicationError):
                 (
                     self._nodes,
                     self._edges,
+                    self._edge_ids,
                     self._relationship_types,
                     self._retired_ids,
+                    self._retired_edge_ids,
                     self._next_node_id,
                     self._version,
                     self._metadata,

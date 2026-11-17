@@ -1,0 +1,28 @@
+# RUTAM CPU Memory Training Configuration
+training:
+  mode: "joint_memory"
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  optimizer_type: "adamw"
+  momentum: 0.9
+  lr_scheduler_type: "cosine"
+  warmup_steps: 10
+  max_steps: 50
+  num_epochs: 5
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  eval_interval_steps: 10
+  early_stopping_patience: 5
+  seed: 42
+  device: "cpu"
+  log_interval_steps: 5
+  memory_simulation_eval: true
+  vocab_size: 100
+  max_seq_len: 64
+
+model:
+  backbone_frozen: true
+  hidden_dim: 16
+  vocab_size: 100
+  num_layers: 2
